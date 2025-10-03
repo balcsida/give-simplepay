@@ -1,8 +1,6 @@
 <?php
 
 use Give\Donations\Models\Donation;
-use Give\Donations\Models\DonationNote;
-use Give\Donations\ValueObjects\DonationStatus;
 use Give\Framework\Exceptions\Primitives\Exception;
 use Give\Framework\Http\Response\Types\RedirectResponse;
 use Give\Framework\PaymentGateways\Commands\PaymentRefunded;
@@ -107,10 +105,11 @@ class SimplePayOffsiteGateway extends PaymentGateway {
                 $donation->id,
                 [
                     'givewp-donation-id' => $donation->id,
-                    'givewp-success-url' => urlencode(give_get_success_page_uri()),
+                    'givewp-success-url' => rawurlencode(give_get_success_page_uri()),
+                    'givewp-failure-url' => rawurlencode(give_get_failed_transaction_uri()),
                 ]
             );
-            
+
             // Prepare donation data
             $transaction_data = [
                 'orderRef' => $order_ref,
@@ -118,7 +117,12 @@ class SimplePayOffsiteGateway extends PaymentGateway {
                 'total' => $donation->amount->formatToDecimal(),
                 'customerEmail' => $donation->email,
                 'language' => get_locale() === 'hu_HU' ? 'HU' : 'EN',
-                'url' => $return_url,
+                'urls' => [
+                    'success' => $return_url,
+                    'fail' => $return_url,
+                    'cancel' => $return_url,
+                    'timeout' => $return_url,
+                ],
                 'invoice' => [
                     'name' => $donation->firstName . ' ' . $donation->lastName,
                     'country' => $donation->billingCountry ?: 'US',
@@ -198,69 +202,16 @@ class SimplePayOffsiteGateway extends PaymentGateway {
             throw new PaymentGatewayException(__('Donation not found', 'simplepay-givewp'));
         }
         
-        // Query the transaction status
-        $transaction_id = $donation->gatewayTransactionId;
-        
-        if (empty($transaction_id)) {
-            $transaction_id = give_get_meta($donation->id, '_simplepay_transaction_id', true);
-        }
-        
-        if (empty($transaction_id)) {
-            throw new PaymentGatewayException(__('Transaction ID not found', 'simplepay-givewp'));
-        }
-        
-        // Get settings
-        $merchant_id = give_get_option('simplepay_merchant_id');
-        $secret_key = give_get_option('simplepay_secret_key');
-        $sandbox = give_get_option('simplepay_sandbox', 'enabled') === 'enabled';
-        
-        // Create API client
-        $api_client = new SimplePayApiClient($merchant_id, $secret_key, $sandbox);
-        
-        // Query transaction status
-        $response = $api_client->query_transaction($transaction_id);
-        
-        if (empty($response['transactions']) || !isset($response['transactions'][0])) {
-            throw new PaymentGatewayException(__('Transaction not found in SimplePay', 'simplepay-givewp'));
-        }
-        
-        $transaction = $response['transactions'][0];
-        
-        // Check transaction status
-        if ($transaction['status'] === 'FINISHED') {
-            // Update donation status
-            $donation->status = DonationStatus::COMPLETE();
-            $donation->save();
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay payment completed (Transaction ID: %s)', 'simplepay-givewp'),
-                    $transaction_id
-                )
-            ]);
-            
-            // Redirect to success page
-            return new RedirectResponse($success_url);
-        } else {
-            // If not finished, keep processing status
-            $donation->status = DonationStatus::PROCESSING();
-            $donation->save();
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay payment in progress with status: %s (Transaction ID: %s)', 'simplepay-givewp'),
-                    $transaction['status'],
-                    $transaction_id
-                )
-            ]);
-            
-            // Redirect to success page but with processing status
-            return new RedirectResponse($success_url);
-        }
+        $return_handler = new SimplePayReturnHandler();
+
+        $redirectUrl = $return_handler->handleDonationReturn($donation, $queryParams, [
+            'success' => $success_url,
+            'fail' => $queryParams['givewp-failure-url'] ?? '',
+            'cancel' => $queryParams['givewp-failure-url'] ?? '',
+            'timeout' => $queryParams['givewp-failure-url'] ?? '',
+        ]);
+
+        return new RedirectResponse($redirectUrl);
     }
 
     /**
