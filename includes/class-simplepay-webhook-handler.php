@@ -22,7 +22,7 @@ class SimplePayWebhookHandler {
         // Get the signature from the header
         $signature = $this->get_signature_from_header();
         
-        if (!$this->verify_signature($json, $signature)) {
+        if (empty($signature) || !$this->verify_signature($json, $signature)) {
             http_response_code(400);
             exit('Invalid signature');
         }
@@ -42,7 +42,7 @@ class SimplePayWebhookHandler {
         $this->process_ipn_status($ipn_data);
         
         // Send confirmation response
-        $this->send_confirmation($ipn_data, $signature);
+        $this->send_confirmation($ipn_data);
     }
     
     /**
@@ -311,7 +311,7 @@ class SimplePayWebhookHandler {
      * @param array $ipn_data IPN data
      * @param string $received_signature Signature received from SimplePay
      */
-    private function send_confirmation($ipn_data, $received_signature) {
+    private function send_confirmation($ipn_data) {
         // Calculate confirmation signature
         $secret_key = give_get_option('simplepay_secret_key');
         $json_response = json_encode($ipn_data);

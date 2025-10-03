@@ -102,6 +102,16 @@ class SimplePayOnsiteGateway extends PaymentGateway {
             // Create API client
             $api_client = new SimplePayApiClient($merchant_id, $secret_key, $sandbox);
             
+            // Prepare return URLs
+            $return_base = add_query_arg([
+                'give-listener' => 'simplepay-return',
+                'donation-id' => $donation->id,
+                'success-url' => rawurlencode(give_get_success_page_uri()),
+                'failure-url' => rawurlencode(give_get_failed_transaction_uri()),
+                'cancel-url' => rawurlencode(give_get_failed_transaction_uri()),
+                'timeout-url' => rawurlencode(give_get_failed_transaction_uri()),
+            ], home_url('/'));
+
             // Prepare donation data
             $transaction_data = [
                 'orderRef' => $gatewayData['simplepay-order-ref'],
@@ -109,7 +119,12 @@ class SimplePayOnsiteGateway extends PaymentGateway {
                 'total' => $donation->amount->formatToDecimal(),
                 'customerEmail' => $donation->email,
                 'language' => get_locale() === 'hu_HU' ? 'HU' : 'EN',
-                'url' => home_url('?give-listener=simplepay-return&donation-id=' . $donation->id),
+                'urls' => [
+                    'success' => $return_base,
+                    'fail' => $return_base,
+                    'cancel' => $return_base,
+                    'timeout' => $return_base,
+                ],
                 'invoice' => [
                     'name' => $donation->firstName . ' ' . $donation->lastName,
                     'country' => $donation->billingCountry ?: 'US',
@@ -144,12 +159,6 @@ class SimplePayOnsiteGateway extends PaymentGateway {
                     $response['transactionId'] ?? 'N/A'
                 )
             ]);
-            
-            // Return the payment URL in the session for redirecting after this method
-            WP_Session_Tokens::get_instance(get_current_user_id())->update(
-                get_current_user_id(),
-                ['simplepay_payment_url' => $response['paymentUrl']]
-            );
             
             // Return PaymentComplete command
             return new PaymentComplete($response['transactionId']);

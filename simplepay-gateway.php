@@ -23,6 +23,7 @@ define('SIMPLEPAY_GIVEWP_URL', plugin_dir_url(__FILE__));
 add_action('givewp_register_payment_gateway', static function ($paymentGatewayRegister) {
     require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-api-client.php';
     require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-webhook-handler.php';
+    require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-return-handler.php';
     require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-onsite-gateway.php';
     require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-offsite-gateway.php';
     
@@ -51,6 +52,11 @@ add_action('init', function () {
         $webhook_handler = new SimplePayWebhookHandler();
         $webhook_handler->process_webhook();
         exit;
+    }
+    if (isset($_GET['give-listener']) && $_GET['give-listener'] === 'simplepay-return') {
+        require_once SIMPLEPAY_GIVEWP_DIR . 'includes/class-simplepay-return-handler.php';
+        $return_handler = new SimplePayReturnHandler();
+        $return_handler->handleListenerRequest($_GET);
     }
 });
 

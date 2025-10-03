@@ -43,7 +43,7 @@ class SimplePayApiClient {
             'merchant' => $this->merchant_id,
             'sdkVersion' => 'GiveWP_SimplePay_1.0.0',
             'methods' => ['CARD'],
-            'timeout' => date('c', strtotime('+30 minutes')),
+            'timeout' => 1800,
         ], $transaction_data);
 
         return $this->make_request('start', $data);
@@ -62,7 +62,7 @@ class SimplePayApiClient {
             'merchant' => $this->merchant_id,
             'sdkVersion' => 'GiveWP_SimplePay_1.0.0',
             'methods' => ['CARD'],
-            'timeout' => date('c', strtotime('+30 minutes')),
+            'timeout' => 1800,
             'recurring' => $recurring_data
         ], $transaction_data);
 
@@ -188,16 +188,28 @@ class SimplePayApiClient {
         curl_setopt($ch, CURLOPT_TIMEOUT, 60);
 
         $response = curl_exec($ch);
+
+        if ($response === false) {
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new Exception(sprintf(__('SimplePay API connection error: %s', 'simplepay-givewp'), $error));
+        }
+
         $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        $status_code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $header = substr($response, 0, $header_size);
         $body = substr($response, $header_size);
-        
+
         curl_close($ch);
+
+        if ($status_code < 200 || $status_code >= 300) {
+            throw new Exception(sprintf(__('SimplePay API returned HTTP %d', 'simplepay-givewp'), $status_code));
+        }
 
         // Extract signature from header
         $signature = '';
         foreach (explode("\r\n", $header) as $line) {
-            if (strpos($line, 'Signature:') === 0) {
+            if (stripos($line, 'Signature:') === 0) {
                 $signature = trim(substr($line, 10));
                 break;
             }
@@ -225,7 +237,11 @@ class SimplePayApiClient {
      * @return string Random salt
      */
     private function generate_salt() {
-        return md5(uniqid(mt_rand(), true));
+        try {
+            return bin2hex(random_bytes(16));
+        } catch (Exception $exception) {
+            return md5(uniqid(mt_rand(), true));
+        }
     }
 
     /**
