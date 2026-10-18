@@ -1,73 +1,57 @@
 # SimplePay Gateway for GiveWP
 
-This plugin integrates the SimplePay payment gateway with GiveWP, allowing you to accept credit card payments and recurring donations through SimplePay.
+Accept bank card donations and recurring donations in GiveWP through SimplePay (v2.1).
+
+SimplePay has no embeddable card form, so every donation is paid on the hosted SimplePay payment page. The donor is redirected there, returns to your site, and SimplePay's IPN (server-to-server notification) sets the final donation status.
 
 ## Features
 
-- Accept one-time credit card payments through SimplePay
-- Support for recurring donations
-- Two payment methods: onsite and offsite (redirect)
-- Full support for IPN notifications
-- Support for refunds
-- Sandbox mode for testing
+- Hosted SimplePay payment page, donation statuses confirmed by the signed IPN
+- Refunds from the GiveWP donation screen
+- Recurring donations through SimplePay card-registration tokens, charged by an hourly WP-Cron job
+- Sandbox while GiveWP Test Mode is enabled, live otherwise
 
 ## Requirements
 
-- WordPress 5.6 or higher
-- PHP 7.2 or higher
-- GiveWP 2.24.0 or higher
-- SimplePay merchant account
+- WordPress 6.0+
+- PHP 7.4+
+- GiveWP 3.20+ (written against the 4.13 gateway API; not yet certified by SimplePay, test in the sandbox first)
+- GiveWP Recurring Donations add-on for subscriptions
+- A SimplePay merchant account (one merchant ID and secret key per currency; HUF, EUR or USD)
 
 ## Installation
 
-1. Upload the plugin files to the `/wp-content/plugins/simplepay-gateway-givewp` directory, or install the plugin through the WordPress plugins screen.
-2. Activate the plugin through the 'Plugins' screen in WordPress.
-3. Navigate to GiveWP > Settings > Payment Gateways > SimplePay to configure the plugin.
+1. Copy this folder to `wp-content/plugins/give-simplepay`.
+2. Activate **SimplePay Gateway for GiveWP**.
 
 ## Configuration
 
-1. Log in to your SimplePay account and get your Merchant ID and Secret Key.
-2. In WordPress admin, go to GiveWP > Settings > Payment Gateways > SimplePay.
-3. Enter your Merchant ID and Secret Key.
-4. Enable or disable Sandbox mode as needed. Use Sandbox mode for testing.
-5. Copy the IPN URL shown in the settings and set it in your SimplePay account.
-6. Enable the SimplePay gateways in the Payment Gateways section.
+1. Go to Donations > Settings > Payment Gateways > SimplePay and enter the merchant ID and secret key.
+2. Copy the IPN URL shown on that page into the SimplePay merchant admin (Technical details).
+3. Enable **SimplePay** under Donations > Settings > Payment Gateways > Gateways.
 
-## Payment Methods
+GiveWP Test Mode selects the SimplePay sandbox; the same merchant ID and secret key work in both environments.
 
-### SimplePay - Credit Card (Onsite)
+## How a donation flows
 
-This method keeps the donor on your website throughout the donation process. The donor will provide their payment details directly on the SimplePay payment page that appears in a secure context.
+1. The donor submits the form and is redirected to SimplePay.
+2. After paying, the donor returns to your site and the donation is marked Processing. A cancelled or timed-out payment is marked Cancelled, a declined one Failed.
+3. SimplePay's IPN arrives and the donation becomes Complete (or Failed / Cancelled).
 
-### SimplePay - Redirect (Offsite)
+The page the donor lands on shows the result and the SimplePay transaction ID, as SimplePay requires. The data-transfer declaration shown on the form is also a SimplePay requirement.
 
-This method redirects the donor to the SimplePay website to complete their payment. After the payment is completed, the donor will be redirected back to your website.
+SimplePay needs a billing address (city, postcode, street) for every charge. If the form does not collect one, the donor enters it on the SimplePay payment page.
 
-## Recurring Donations
+## Recurring donations
 
-The plugin supports recurring donations through SimplePay's token-based recurring payment system. When a donor sets up a recurring donation:
+The first payment registers the card and returns up to 24 tokens, one per renewal, valid until the last renewal they cover (at most 5 years, and never beyond the card's expiry). Due renewals are charged hourly, using one token each; a renewal is recorded as Processing until its IPN arrives. After 3 consecutive failures, or when the tokens run out, the subscription is marked Failing and the donor must start a new recurring donation. Cancelling a subscription cancels its remaining tokens.
 
-1. The plugin registers their card with SimplePay and receives a set of tokens.
-2. For each renewal, the plugin uses one of these tokens to process the payment.
-3. The plugin automatically rotates tokens as needed.
-
-## Webhooks
-
-The plugin automatically handles SimplePay IPN (Instant Payment Notification) webhooks to update donation statuses. Make sure to configure the IPN URL in your SimplePay account settings.
+Renewals are charged without a payment page, so add the billing address fields to recurring forms; SimplePay may reject token charges without billing details.
 
 ## Troubleshooting
 
-If you encounter any issues with the plugin:
-
-1. Enable Debug Mode in the plugin settings to log API requests and responses.
-2. Check the logs in the wp-content/uploads/give-logs directory.
-3. Verify that your Merchant ID and Secret Key are correctly entered.
-4. Ensure your server can make outbound HTTPS requests to the SimplePay API.
-
-## Support
-
-If you need help with the plugin, please contact your SimplePay representative or open an issue on GitHub.
+Check Donations > Tools > Logs. Make sure the IPN URL is reachable from SimplePay's IP ranges: 80.249.162.112/28, 84.2.229.128/27, 195.228.18.224/29.
 
 ## License
 
-This plugin is released under the GPL v2 or later.
+GPL-2.0-or-later
