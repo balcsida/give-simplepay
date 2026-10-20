@@ -3,274 +3,193 @@
 use Give\Donations\Models\Donation;
 use Give\Donations\Models\DonationNote;
 use Give\Donations\ValueObjects\DonationStatus;
-use Give\Framework\Exceptions\Primitives\Exception;
-use Give\Framework\PaymentGateways\Commands\SubscriptionComplete;
-use Give\Framework\PaymentGateways\Commands\SubscriptionProcessing;
+use Give\Framework\PaymentGateways\Commands\RedirectOffsite;
 use Give\Framework\PaymentGateways\Exceptions\PaymentGatewayException;
+use Give\Framework\PaymentGateways\Log\PaymentGatewayLog;
 use Give\Framework\PaymentGateways\SubscriptionModule;
 use Give\Subscriptions\Models\Subscription;
 use Give\Subscriptions\ValueObjects\SubscriptionStatus;
 
 /**
- * SimplePay Subscription Module Class
- * Handles recurring donations with SimplePay
+ * Recurring donations: the first payment registers the card and returns tokens, one per later charge.
+ * An hourly cron job (processDueRenewals) charges one token per due renewal.
  */
 class SimplePaySubscriptionModule extends SubscriptionModule {
 
-    /**
-     * @inheritDoc
-     * @throws PaymentGatewayException
-     */
+    const TOKENS_META = '_simplepay_tokens';
+    const FAILURES_META = '_simplepay_renewal_failures';
+    const MAX_TOKENS = 24;
+    const MAX_FAILURES = 3;
+
     public function createSubscription(Donation $donation, Subscription $subscription, $gatewayData) {
-        try {
-            // Get settings
-            $merchant_id = give_get_option('simplepay_merchant_id');
-            $secret_key = give_get_option('simplepay_secret_key');
-            $sandbox = give_get_option('simplepay_sandbox', 'enabled') === 'enabled';
-            
-            // Create API client
-            $api_client = new SimplePayApiClient($merchant_id, $secret_key, $sandbox);
-            
-            // Get order reference from gateway data or generate one
-            $order_ref = $gatewayData['simplepay-order-ref'] ?? 'givewp_sub_' . uniqid('', true);
-            
-            // Store order reference in subscription meta
-            give_update_meta($subscription->id, '_simplepay_order_ref', $order_ref);
-            
-            // Prepare recurring data based on subscription details
-            $recurring_data = [
-                'times' => 24, // Maximum allowed by SimplePay
-                'until' => date('c', strtotime('+5 years')), // Set a far future date
-                'maxAmount' => $subscription->amount->formatToDecimal() * 1.5, // Allow some buffer for amount changes
-            ];
-            
-            // Prepare transaction data
-            $transaction_data = [
-                'orderRef' => $order_ref,
-                'currency' => $donation->amount->getCurrency()->getCode(),
-                'total' => $donation->amount->formatToDecimal(),
-                'customerEmail' => $donation->email,
-                'language' => get_locale() === 'hu_HU' ? 'HU' : 'EN',
-                'url' => home_url('?give-listener=simplepay-return&subscription-id=' . $subscription->id),
-                'invoice' => [
-                    'name' => $donation->firstName . ' ' . $donation->lastName,
-                    'country' => $donation->billingCountry ?: 'US',
-                    'state' => $donation->billingState ?: '',
-                    'city' => $donation->billingCity ?: '',
-                    'zip' => $donation->billingPostCode ?: '',
-                    'address' => $donation->billingAddress1 ?: '',
-                    'address2' => $donation->billingAddress2 ?: '',
-                ],
-                'threeDSReqAuthMethod' => '02', // Registered with merchant
-            ];
-            
-            // Create the recurring payment in SimplePay
-            $response = $api_client->create_recurring_payment($transaction_data, $recurring_data);
-            
-            // Store transaction ID and tokens in subscription meta
-            if (isset($response['transactionId'])) {
-                give_update_meta($subscription->id, '_simplepay_transaction_id', $response['transactionId']);
-            }
-            
-            if (isset($response['tokens']) && is_array($response['tokens'])) {
-                // Store all tokens for future use
-                give_update_meta($subscription->id, '_simplepay_tokens', $response['tokens']);
-                
-                // Store the first token as the active one
-                if (!empty($response['tokens'][0])) {
-                    give_update_meta($subscription->id, '_simplepay_active_token', $response['tokens'][0]);
-                    
-                    // Also store the token count
-                    give_update_meta($subscription->id, '_simplepay_token_count', count($response['tokens']));
-                    give_update_meta($subscription->id, '_simplepay_tokens_used', 0);
-                }
-            }
-            
-            // Update donation status
-            $donation->status = DonationStatus::PROCESSING();
-            $donation->gatewayTransactionId = $response['transactionId'] ?? '';
-            $donation->save();
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay recurring payment initiated (Transaction ID: %s)', 'simplepay-givewp'),
-                    $response['transactionId'] ?? 'N/A'
-                )
-            ]);
-            
-            // Return SubscriptionProcessing as we need to wait for IPN to confirm
-            return new SubscriptionProcessing();
-            
-        } catch (Exception $e) {
-            // Log error and update donation status
-            $donation->status = DonationStatus::FAILED();
-            $donation->save();
-            
-            // Update subscription status
-            $subscription->status = SubscriptionStatus::FAILING();
-            $subscription->save();
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay recurring payment failed: %s', 'simplepay-givewp'),
-                    $e->getMessage()
-                )
-            ]);
-            
-            // Throw exception to be caught by GiveWP
-            throw new PaymentGatewayException($e->getMessage());
+        // The initial payment is installment one
+        $times = $subscription->installments > 0 ? max(1, min(self::MAX_TOKENS, $subscription->installments - 1)) : self::MAX_TOKENS;
+        $code = $subscription->amount->getCurrency()->getCode();
+
+        $response = $this->gateway->startTransaction($donation, (array) $gatewayData, [
+            'recurring' => [
+                'times'     => $times,
+                'until'     => date('c', self::tokensValidUntil($subscription, $times)),
+                'maxAmount' => SimplePayApiClient::formatAmount($subscription->amount->formatToDecimal(), $code),
+            ],
+        ]);
+
+        $tokens = $response['tokens'] ?? [];
+        if (empty($tokens)) {
+            throw new PaymentGatewayException(
+                __('SimplePay did not return recurring tokens. Check that card registration is enabled on your merchant account.', 'give-simplepay')
+            );
         }
+
+        give()->subscription_meta->update_meta($subscription->id, self::TOKENS_META, array_values($tokens));
+
+        $subscription->gatewaySubscriptionId = (string) $response['transactionId'];
+        $subscription->transactionId = (string) $response['transactionId'];
+        $subscription->save();
+
+        return new RedirectOffsite($response['paymentUrl']);
     }
 
     /**
-     * Process a renewal payment for a subscription
-     * 
-     * @param Subscription $subscription The subscription to renew
-     * @param Donation $donation The renewal donation
-     * @return void
-     * @throws PaymentGatewayException
+     * Tokens must outlive the last renewal they cover, plus a month of cron slack.
+     * shortcut: capped at 5 years because SimplePay does not document the maximum token validity; lower it if start returns error 5086.
      */
-    public function processRenewal(Subscription $subscription, Donation $donation) {
-        try {
-            // Get settings
-            $merchant_id = give_get_option('simplepay_merchant_id');
-            $secret_key = give_get_option('simplepay_secret_key');
-            $sandbox = give_get_option('simplepay_sandbox', 'enabled') === 'enabled';
-            
-            // Create API client
-            $api_client = new SimplePayApiClient($merchant_id, $secret_key, $sandbox);
-            
-            // Get active token
-            $token = give_get_meta($subscription->id, '_simplepay_active_token', true);
-            
-            if (empty($token)) {
-                throw new PaymentGatewayException(__('No active token found for renewal', 'simplepay-givewp'));
-            }
-            
-            // Check token status
-            $token_response = $api_client->query_token($token);
-            
-            if ($token_response['status'] !== 'active') {
-                throw new PaymentGatewayException(__('Token is not active', 'simplepay-givewp'));
-            }
-            
-            // Generate a unique order reference for this renewal
-            $order_ref = 'givewp_renewal_' . uniqid('', true);
-            give_update_meta($donation->id, '_simplepay_order_ref', $order_ref);
-            
-            // Prepare payment data
-            $payment_data = [
-                'orderRef' => $order_ref,
-                'currency' => $donation->amount->getCurrency()->getCode(),
-                'total' => $donation->amount->formatToDecimal(),
-                'customerEmail' => $donation->email,
-            ];
-            
-            // Process the recurring payment
-            $response = $api_client->process_recurring_payment($payment_data, $token);
-            
-            // If we got here, the payment was successful
-            $donation->status = DonationStatus::COMPLETE();
-            $donation->gatewayTransactionId = $response['transactionId'] ?? '';
-            $donation->save();
-            
-            // Mark the token as used and update the count
-            $tokens_used = (int) give_get_meta($subscription->id, '_simplepay_tokens_used', true);
-            give_update_meta($subscription->id, '_simplepay_tokens_used', $tokens_used + 1);
-            
-            // Check if we need to rotate to the next token
-            $this->rotateTokenIfNeeded($subscription);
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay recurring payment successful (Transaction ID: %s)', 'simplepay-givewp'),
-                    $response['transactionId'] ?? 'N/A'
-                )
-            ]);
-            
-        } catch (Exception $e) {
-            // Log error and update donation status
-            $donation->status = DonationStatus::FAILED();
-            $donation->save();
-            
-            // Add donation note
-            DonationNote::create([
-                'donationId' => $donation->id,
-                'content' => sprintf(
-                    __('SimplePay recurring payment failed: %s', 'simplepay-givewp'),
-                    $e->getMessage()
-                )
-            ]);
-            
-            // Throw exception to be caught by GiveWP
-            throw new PaymentGatewayException($e->getMessage());
-        }
+    private static function tokensValidUntil(Subscription $subscription, int $times): int {
+        $period = $subscription->period->getValue();
+        $count = $times * $subscription->frequency * ($period === 'quarter' ? 3 : 1);
+        $unit = $period === 'quarter' ? 'month' : $period;
+
+        return min(strtotime("+{$count} {$unit} +1 month"), strtotime('+5 years'));
     }
 
-    /**
-     * Rotate to the next token if the current one is used
-     * 
-     * @param Subscription $subscription The subscription
-     * @return void
-     */
-    private function rotateTokenIfNeeded(Subscription $subscription) {
-        // Get all tokens and the current used count
-        $tokens = give_get_meta($subscription->id, '_simplepay_tokens', true);
-        $tokens_used = (int) give_get_meta($subscription->id, '_simplepay_tokens_used', true);
-        
-        // If we've used all tokens, we need to create a new set
-        if (!is_array($tokens) || empty($tokens) || $tokens_used >= count($tokens)) {
-            // This would require a new card registration, which is not supported yet
-            // For now, just mark the subscription as failing
-            $subscription->status = SubscriptionStatus::FAILING();
-            $subscription->save();
-            return;
-        }
-        
-        // Otherwise, rotate to the next token
-        give_update_meta($subscription->id, '_simplepay_active_token', $tokens[$tokens_used]);
-    }
-
-    /**
-     * @inheritDoc
-     * @throws PaymentGatewayException
-     */
     public function cancelSubscription(Subscription $subscription) {
         try {
-            // Get settings
-            $merchant_id = give_get_option('simplepay_merchant_id');
-            $secret_key = give_get_option('simplepay_secret_key');
-            $sandbox = give_get_option('simplepay_sandbox', 'enabled') === 'enabled';
-            
-            // Create API client
-            $api_client = new SimplePayApiClient($merchant_id, $secret_key, $sandbox);
-            
-            // Get all tokens and cancel them
-            $tokens = give_get_meta($subscription->id, '_simplepay_tokens', true);
-            
-            if (is_array($tokens) && !empty($tokens)) {
-                foreach ($tokens as $token) {
-                    try {
-                        $api_client->cancel_token($token);
-                    } catch (Exception $e) {
-                        // Continue with other tokens even if one fails
-                        continue;
-                    }
-                }
+            $client = SimplePayApiClient::fromSettings($subscription->mode->isTest());
+            foreach (array_filter((array) give()->subscription_meta->get_meta($subscription->id, self::TOKENS_META, true)) as $token) {
+                $client->tokenCancel($token);
             }
-            
-            // Update subscription status
-            $subscription->status = SubscriptionStatus::CANCELLED();
+        } catch (\Throwable $e) {
+            // Best effort: once cancelled here the remaining tokens are never charged anyway
+            PaymentGatewayLog::warning('SimplePay tokens could not be cancelled', ['subscriptionId' => $subscription->id, 'reason' => $e->getMessage()]);
+        }
+
+        give()->subscription_meta->delete_meta($subscription->id, self::TOKENS_META);
+
+        $subscription->status = SubscriptionStatus::CANCELLED();
+        $subscription->save();
+    }
+
+    public static function processDueRenewals(): void {
+        $due = Subscription::query()
+            ->where('status', SubscriptionStatus::ACTIVE()->getValue())
+            ->where('expiration', current_time('mysql'), '<=')
+            ->getAll() ?: [];
+
+        foreach ($due as $subscription) {
+            if ($subscription->gatewayId !== SimplePayGateway::id()) {
+                continue;
+            }
+
+            if ($subscription->shouldEndSubscription()) {
+                $subscription->status = SubscriptionStatus::COMPLETED();
+                $subscription->save();
+                continue;
+            }
+
+            try {
+                self::chargeRenewal($subscription);
+            } catch (\Throwable $e) {
+                self::recordFailure($subscription, $e->getMessage());
+            }
+        }
+    }
+
+    private static function chargeRenewal(Subscription $subscription): void {
+        $tokens = array_values(array_filter((array) give()->subscription_meta->get_meta($subscription->id, self::TOKENS_META, true)));
+        if (empty($tokens)) {
+            $subscription->status = SubscriptionStatus::FAILING();
             $subscription->save();
-            
-        } catch (Exception $e) {
-            throw new PaymentGatewayException($e->getMessage());
+            PaymentGatewayLog::warning(
+                'SimplePay tokens exhausted or missing; the donor must set up a new recurring donation',
+                ['subscriptionId' => $subscription->id]
+            );
+            return;
+        }
+
+        $initial = $subscription->initialDonation();
+        if (!$initial) {
+            throw new \RuntimeException('Initial donation not found');
+        }
+
+        $client = SimplePayApiClient::fromSettings($subscription->mode->isTest());
+        $code = $subscription->amount->getCurrency()->getCode();
+
+        $request = [
+            'orderRef'             => 'givewp-' . $subscription->id . '-' . time(),
+            'currency'             => $code,
+            'total'                => SimplePayApiClient::formatAmount($subscription->amount->formatToDecimal(), $code),
+            'customerEmail'        => $initial->email,
+            'customer'             => trim($initial->firstName . ' ' . $initial->lastName),
+            'language'             => SimplePayApiClient::language(get_locale()),
+            'methods'              => ['CARD'],
+            'token'                => $tokens[0],
+            'type'                 => 'MIT',
+            'threeDSReqAuthMethod' => '02',
+            'twoStep'              => false,
+        ];
+        if ($invoice = SimplePayGateway::invoice($initial)) {
+            $request['invoice'] = $invoice;
+        }
+
+        $response = $client->doRecurring($request);
+        if (empty($response['transactionId'])) {
+            throw new \RuntimeException('SimplePay did not return a transaction ID');
+        }
+
+        // The card is charged from here on: a failure to record it must stop the hourly retry, not repeat the charge
+        try {
+            array_shift($tokens);
+            give()->subscription_meta->update_meta($subscription->id, self::TOKENS_META, $tokens);
+            give()->subscription_meta->update_meta($subscription->id, self::FAILURES_META, 0);
+
+            $renewal = $subscription->createRenewal([
+                'gatewayTransactionId' => (string) $response['transactionId'],
+                'status'               => DonationStatus::PROCESSING(),
+            ]);
+            DonationNote::create([
+                'donationId' => $renewal->id,
+                'content'    => sprintf('SimplePay recurring charge started (transaction %s); awaiting IPN.', $response['transactionId']),
+            ]);
+
+            // Skip periods missed while the site was down instead of charging them one per hour
+            for ($i = 0; $i < 100 && $subscription->renewsAt->getTimestamp() <= time(); $i++) {
+                $subscription->bumpRenewalDate();
+            }
+            $subscription->save();
+        } catch (\Throwable $e) {
+            $subscription->status = SubscriptionStatus::FAILING();
+            $subscription->save();
+            PaymentGatewayLog::error('SimplePay renewal charged but not recorded', [
+                'subscriptionId' => $subscription->id,
+                'transactionId'  => $response['transactionId'],
+                'reason'         => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private static function recordFailure(Subscription $subscription, string $reason): void {
+        $failures = (int) give()->subscription_meta->get_meta($subscription->id, self::FAILURES_META, true) + 1;
+        give()->subscription_meta->update_meta($subscription->id, self::FAILURES_META, $failures);
+
+        PaymentGatewayLog::error('SimplePay renewal failed', [
+            'subscriptionId' => $subscription->id,
+            'attempt'        => $failures,
+            'reason'         => $reason,
+        ]);
+
+        if ($failures >= self::MAX_FAILURES) {
+            $subscription->status = SubscriptionStatus::FAILING();
+            $subscription->save();
         }
     }
 }
